@@ -1,0 +1,24 @@
+# Example: How a consumer repo (e.g. nx-development-tf) calls the shared workflow
+#
+# Place this in: .github/workflows/infra-deploy.yml
+
+name: Terraform Plan and Apply
+
+on:
+  push:
+    branches: main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: Nvision-x/shared-workflows-public/.github/workflows/terraform-aws-deploy.yml@main
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      terraform_version: "1.13.1"
+      aws_region: "us-east-1"
+      aws_account_id: "769537049595"
+    secrets:
+      tf_var_docker_hub_token: ${{ secrets.DOCKER_HUB_RO_TOKEN }}
+      tf_var_github_cr_token: ${{ secrets.GH_REGISTRY_RO_PAT }}

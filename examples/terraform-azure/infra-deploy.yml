@@ -1,0 +1,22 @@
+# Example: Azure Terraform deploy
+#
+# Place this in: .github/workflows/infra-deploy.yml
+
+name: Terraform Plan and Apply
+
+on:
+  push:
+    branches: main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: Nvision-x/shared-workflows-public/.github/workflows/terraform-azure-deploy.yml@main
+    with:
+      terraform_version: "1.13.1"
+    secrets:
+      azure_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+      azure_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+      azure_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      tf_var_docker_hub_token: ${{ secrets.DOCKER_HUB_RO_TOKEN }}
+      tf_var_github_cr_token: ${{ secrets.GH_REGISTRY_RO_PAT }}

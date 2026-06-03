@@ -1,0 +1,97 @@
+name: Terraform Plan (AWS)
+
+on:
+  workflow_call:
+    inputs:
+      terraform_version:
+        description: Terraform version to use
+        type: string
+        default: "1.13.1"
+      working_directory:
+        description: Directory containing Terraform configuration
+        type: string
+        default: "."
+      aws_region:
+        description: AWS region
+        type: string
+        default: "us-east-1"
+      aws_account_id:
+        description: AWS account ID (used to construct arn:aws:iam::<account_id>:role/NxGitHubActionsRole)
+        type: string
+        required: true
+      aws_iam_role_name:
+        description: IAM role name for OIDC authentication
+        type: string
+        default: "NxGitHubActionsRole"
+    secrets:
+      tf_var_docker_hub_token:
+        description: Docker Hub read-only token
+        required: false
+      tf_var_github_cr_token:
+        description: GitHub Container Registry read-only PAT
+        required: false
+      git_auth_token:
+        description: GitHub PAT with repo read access for cloning private Terraform modules across the org
+        required: false
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: codebuild-github-actions-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Configure AWS OIDC credentials
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: arn:aws:iam::${{ inputs.aws_account_id }}:role/${{ inputs.aws_iam_role_name }}
+        aws-region: ${{ inputs.aws_region }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: ${{ inputs.terraform_version }}
+        terraform_wrapper: false
+
+    - name: Configure git for private modules
+      env:
+        GIT_AUTH_TOKEN: ${{ secrets.git_auth_token }}
+      if: ${{ env.GIT_AUTH_TOKEN != '' }}
+      run: git config --global url."https://x-access-token:${GIT_AUTH_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+    - name: Terraform Init
+      id: init
+      run: terraform init
+
+    - name: Terraform Validate
+      id: validate
+      run: terraform validate -no-color
+
+    - name: Terraform Plan
+      id: plan
+      run: |
+        terraform plan -no-color -input=false -out=tfplan
+        terraform show -no-color tfplan
+      continue-on-error: false
+      env:
+        TF_VAR_docker_hub_token: ${{ secrets.tf_var_docker_hub_token }}
+        TF_VAR_github_cr_token: ${{ secrets.tf_var_github_cr_token }}
+
+    - name: Upload Plan File
+      uses: actions/upload-artifact@v7
+      with:
+        name: terraform-plan
+        path: ${{ inputs.working_directory }}/tfplan
+        retention-days: 1
+
+    - name: Check Plan Status
+      if: steps.plan.outputs.exitcode == 1
+      run: exit 1

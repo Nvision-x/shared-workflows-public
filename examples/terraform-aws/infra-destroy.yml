@@ -1,0 +1,28 @@
+# Example: Terraform destroy with confirmation gate
+#
+# Place this in: .github/workflows/infra-destroy.yml
+
+name: Terraform Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: 'Type "DESTROY" to confirm infrastructure destruction'
+        required: true
+        type: string
+
+jobs:
+  destroy:
+    uses: Nvision-x/shared-workflows-public/.github/workflows/terraform-aws-destroy.yml@main
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      terraform_version: "1.13.1"
+      aws_region: "us-east-1"
+      aws_account_id: "769537049595"
+      confirm_destroy: ${{ inputs.confirm_destroy }}
+    secrets:
+      tf_var_docker_hub_token: ${{ secrets.DOCKER_HUB_RO_TOKEN }}
+      tf_var_github_cr_token: ${{ secrets.GH_REGISTRY_RO_PAT }}

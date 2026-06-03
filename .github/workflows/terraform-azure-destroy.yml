@@ -1,0 +1,208 @@
+name: Terraform Destroy (Azure)
+
+on:
+  workflow_call:
+    inputs:
+      terraform_version:
+        description: Terraform version to use
+        type: string
+        default: "1.13.1"
+      working_directory:
+        description: Directory containing Terraform configuration
+        type: string
+        default: "."
+      runner:
+        description: GitHub Actions runner label
+        type: string
+        default: "ubuntu-latest"
+      confirm_destroy:
+        description: Must be "DESTROY" to proceed
+        type: string
+        required: true
+      destroy_environment:
+        description: GitHub environment for manual approval gate
+        type: string
+        default: "production-destroy"
+    secrets:
+      azure_client_id:
+        description: Azure AD application client ID
+        required: true
+      azure_tenant_id:
+        description: Azure AD tenant ID
+        required: true
+      azure_subscription_id:
+        description: Azure subscription ID
+        required: true
+      tf_var_docker_hub_token:
+        description: Docker Hub read-only token
+        required: false
+      tf_var_github_cr_token:
+        description: GitHub Container Registry read-only PAT
+        required: false
+      git_auth_token:
+        description: GitHub PAT with repo read access for cloning private Terraform modules across the org
+        required: false
+
+jobs:
+  confirm-destroy:
+    name: Confirm Destroy
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      proceed: ${{ steps.confirm.outputs.proceed }}
+    steps:
+    - name: Validate Confirmation
+      id: confirm
+      run: |
+        if [ "${{ inputs.confirm_destroy }}" != "DESTROY" ]; then
+          echo "Confirmation text does not match 'DESTROY'"
+          echo "proceed=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        echo "Destruction confirmed"
+        echo "proceed=true" >> $GITHUB_OUTPUT
+
+  terraform-plan-destroy:
+    name: Terraform Plan Destroy
+    needs: confirm-destroy
+    if: needs.confirm-destroy.outputs.proceed == 'true'
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+    env:
+      ARM_CLIENT_ID: ${{ secrets.azure_client_id }}
+      ARM_TENANT_ID: ${{ secrets.azure_tenant_id }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.azure_subscription_id }}
+      ARM_USE_OIDC: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Install Azure CLI
+      run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+    - name: Azure Login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.azure_client_id }}
+        tenant-id: ${{ secrets.azure_tenant_id }}
+        subscription-id: ${{ secrets.azure_subscription_id }}
+
+    - name: Configure Git Credentials for Private Modules
+      if: ${{ env.GIT_AUTH_TOKEN != '' }}
+      run: git config --global url."https://x-access-token:${GIT_AUTH_TOKEN}@github.com/".insteadOf "https://github.com/"
+      env:
+        GIT_AUTH_TOKEN: ${{ secrets.git_auth_token }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: ${{ inputs.terraform_version }}
+        terraform_wrapper: false
+
+    - name: Terraform Init
+      id: init
+      run: terraform init
+
+    - name: Terraform Validate
+      id: validate
+      run: terraform validate -no-color
+
+    - name: Terraform Plan Destroy
+      id: plan
+      run: |
+        terraform plan -destroy -no-color -input=false -out=tfplan-destroy
+        terraform show -no-color tfplan-destroy
+      continue-on-error: true
+      env:
+        TF_VAR_docker_hub_token: ${{ secrets.tf_var_docker_hub_token }}
+        TF_VAR_github_cr_token: ${{ secrets.tf_var_github_cr_token }}
+
+    - name: Upload Destroy Plan File
+      uses: actions/upload-artifact@v7
+      with:
+        name: terraform-destroy-plan
+        path: ${{ inputs.working_directory }}/tfplan-destroy
+        retention-days: 1
+
+    - name: Check Plan Status
+      if: steps.plan.outputs.exitcode == 1
+      run: exit 1
+
+  terraform-destroy:
+    name: Terraform Destroy
+    needs: [confirm-destroy, terraform-plan-destroy]
+    if: needs.confirm-destroy.outputs.proceed == 'true' && needs.terraform-plan-destroy.outputs.plan-exitcode == 0
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      id-token: write
+      contents: read
+    environment: ${{ inputs.destroy_environment }}
+    env:
+      ARM_CLIENT_ID: ${{ secrets.azure_client_id }}
+      ARM_TENANT_ID: ${{ secrets.azure_tenant_id }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.azure_subscription_id }}
+      ARM_USE_OIDC: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Install Azure CLI
+      run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+    - name: Azure Login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.azure_client_id }}
+        tenant-id: ${{ secrets.azure_tenant_id }}
+        subscription-id: ${{ secrets.azure_subscription_id }}
+
+    - name: Configure Git Credentials for Private Modules
+      if: ${{ env.GIT_AUTH_TOKEN != '' }}
+      run: git config --global url."https://x-access-token:${GIT_AUTH_TOKEN}@github.com/".insteadOf "https://github.com/"
+      env:
+        GIT_AUTH_TOKEN: ${{ secrets.git_auth_token }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: ${{ inputs.terraform_version }}
+        terraform_wrapper: false
+
+    - name: Download Destroy Plan File
+      uses: actions/download-artifact@v8
+      with:
+        name: terraform-destroy-plan
+        path: ${{ inputs.working_directory }}
+
+    - name: Terraform Init
+      run: terraform init
+
+    - name: Display Destroy Summary
+      run: |
+        echo "## Destroy Summary"
+        echo "The following resources will be DESTROYED:"
+        echo ""
+        terraform show -no-color tfplan-destroy | head -50
+        echo ""
+        echo "FINAL WARNING: Resources will be permanently destroyed"
+        echo "Confirmed by: ${{ github.actor }}"
+
+    - name: Terraform Destroy
+      run: terraform apply -auto-approve tfplan-destroy
+      env:
+        TF_VAR_docker_hub_token: ${{ secrets.tf_var_docker_hub_token }}
+        TF_VAR_github_cr_token: ${{ secrets.tf_var_github_cr_token }}
+
+    - name: Cleanup Destroy Plan File
+      run: rm -f tfplan-destroy
