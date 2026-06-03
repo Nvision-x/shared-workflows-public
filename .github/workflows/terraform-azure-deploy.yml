@@ -61,7 +61,7 @@ jobs:
       run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 
     - name: Azure Login (OIDC)
-      uses: azure/login@v2
+      uses: azure/login@v3
       with:
         client-id: ${{ secrets.azure_client_id }}
         tenant-id: ${{ secrets.azure_tenant_id }}
@@ -133,7 +133,7 @@ jobs:
       run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 
     - name: Azure Login (OIDC)
-      uses: azure/login@v2
+      uses: azure/login@v3
       with:
         client-id: ${{ secrets.azure_client_id }}
         tenant-id: ${{ secrets.azure_tenant_id }}
