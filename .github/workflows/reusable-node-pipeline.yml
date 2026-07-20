@@ -1,0 +1,241 @@
+name: Node.js Build & Test Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version to use
+        type: string
+        default: "22"
+      package-manager:
+        description: "Package manager: pnpm, npm, or yarn"
+        type: string
+        default: "pnpm"
+      pnpm-version:
+        description: "pnpm version (only used when package-manager is pnpm). Leave empty to read from packageManager in package.json."
+        type: string
+        default: ""
+      working-directory:
+        description: Working directory for all commands
+        type: string
+        default: "."
+      install-cmd:
+        description: Install command override (leave empty for auto-detect)
+        type: string
+        default: ""
+      lint-cmd:
+        description: Lint/format check command (leave empty to skip)
+        type: string
+        default: ""
+      test-cmd:
+        description: Test command (leave empty to skip)
+        type: string
+        default: ""
+      build-cmd:
+        description: Build command (leave empty to skip)
+        type: string
+        default: ""
+      enable-security-scan:
+        description: Run pnpm/npm audit and Trivy filesystem scan
+        type: boolean
+        default: true
+      audit-level:
+        description: Minimum severity for audit (low, moderate, high, critical)
+        type: string
+        default: "high"
+      trivy-severity:
+        description: Trivy severity levels to check
+        type: string
+        default: "CRITICAL,HIGH"
+      trivy-exit-code:
+        description: "Trivy exit code on findings (1 = fail, 0 = warn only)"
+        type: string
+        default: "1"
+      runner:
+        description: GitHub Actions runner label
+        type: string
+        default: "ubuntu-latest"
+      upload-build-artifact:
+        description: Upload the build output so downstream jobs can reuse it instead of rebuilding
+        type: boolean
+        default: false
+      build-artifact-name:
+        description: Name of the uploaded build artifact
+        type: string
+        default: "build-output"
+      build-artifact-path:
+        description: Path (relative to working-directory) of the build output to upload
+        type: string
+        default: "dist"
+      build-artifact-retention-days:
+        description: Retention period for the uploaded build artifact
+        type: string
+        default: "1"
+    secrets:
+      NODE_AUTH_TOKEN:
+        description: Auth token for private package registries (e.g. GitHub Packages)
+        required: false
+      BUILD_ENV:
+        description: "Newline-separated KEY=value pairs exported before the build (e.g. VITE_ vars inlined at build time)"
+        required: false
+    outputs:
+      build-result:
+        description: Result of the build-test job
+        value: ${{ jobs.build-test.result }}
+      security-result:
+        description: Result of the security-scan job
+        value: ${{ jobs.security-scan.result }}
+
+jobs:
+  build-test:
+    name: Build & Test
+    runs-on: ${{ inputs.runner }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm (with explicit version)
+        if: inputs.package-manager == 'pnpm' && inputs.pnpm-version != ''
+        uses: pnpm/action-setup@v5
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Setup pnpm (from packageManager)
+        if: inputs.package-manager == 'pnpm' && inputs.pnpm-version == ''
+        uses: pnpm/action-setup@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          registry-url: https://npm.pkg.github.com
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+
+      - name: Install dependencies
+        env:
+          INSTALL_CMD: ${{ inputs.install-cmd }}
+          PKG_MANAGER: ${{ inputs.package-manager }}
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+        run: |
+          if [ -n "$INSTALL_CMD" ]; then
+            eval "$INSTALL_CMD"
+          elif [ "$PKG_MANAGER" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          elif [ "$PKG_MANAGER" = "yarn" ]; then
+            yarn install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Lint & format check
+        if: inputs.lint-cmd != ''
+        run: ${{ inputs.lint-cmd }}
+
+      - name: Run tests
+        if: inputs.test-cmd != ''
+        run: ${{ inputs.test-cmd }}
+
+      # Dedicated coverage artifact for downstream sonarcloud scan
+      - name: Upload coverage for SonarCloud
+        uses: actions/upload-artifact@v7
+        if: inputs.test-cmd != '' && hashFiles(format('{0}/coverage/lcov.info', inputs.working-directory)) != ''
+        with:
+          name: node-coverage
+          path: ${{ inputs.working-directory }}/coverage
+          retention-days: 7
+
+      - name: Build
+        if: inputs.build-cmd != ''
+        env:
+          BUILD_CMD: ${{ inputs.build-cmd }}
+          BUILD_ENV: ${{ secrets.BUILD_ENV }}
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+        run: |
+          if [ -n "$BUILD_ENV" ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . <(printf '%s\n' "$BUILD_ENV")
+            set +a
+          fi
+          eval "$BUILD_CMD"
+
+      - name: Upload build artifact
+        if: inputs.build-cmd != '' && inputs.upload-build-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.build-artifact-name }}
+          path: ${{ inputs.working-directory }}/${{ inputs.build-artifact-path }}
+          retention-days: ${{ inputs.build-artifact-retention-days }}
+          if-no-files-found: error
+
+  security-scan:
+    name: Security Scan
+    if: inputs.enable-security-scan
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm (with explicit version)
+        if: inputs.package-manager == 'pnpm' && inputs.pnpm-version != ''
+        uses: pnpm/action-setup@v5
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Setup pnpm (from packageManager)
+        if: inputs.package-manager == 'pnpm' && inputs.pnpm-version == ''
+        uses: pnpm/action-setup@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: https://npm.pkg.github.com
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+
+      - name: Install dependencies for audit
+        env:
+          PKG_MANAGER: ${{ inputs.package-manager }}
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
+        run: |
+          if [ "$PKG_MANAGER" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          elif [ "$PKG_MANAGER" = "yarn" ]; then
+            yarn install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Package audit
+        env:
+          PKG_MANAGER: ${{ inputs.package-manager }}
+          AUDIT_LEVEL: ${{ inputs.audit-level }}
+        run: |
+          if [ "$PKG_MANAGER" = "pnpm" ]; then
+            pnpm audit --audit-level "$AUDIT_LEVEL" --prod || echo "::warning::pnpm audit failed (endpoint may be unavailable)"
+          elif [ "$PKG_MANAGER" = "yarn" ]; then
+            yarn audit --level "$AUDIT_LEVEL"
+          else
+            npm audit --audit-level="$AUDIT_LEVEL" --omit=dev
+          fi
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.working-directory }}
+          format: table
+          ignore-unfixed: true
+          severity: ${{ inputs.trivy-severity }}
+          exit-code: ${{ inputs.trivy-exit-code }}

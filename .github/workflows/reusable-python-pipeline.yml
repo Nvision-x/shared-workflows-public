@@ -1,0 +1,391 @@
+name: Reusable Python CI/CD Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: false
+        type: string
+        default: '3.13'
+      working-directory:
+        description: 'Working directory for the project'
+        required: false
+        type: string
+        default: '.'
+      image-name:
+        description: 'Container image name (defaults to repo name)'
+        required: false
+        type: string
+        default: ''
+      enable-security-scan:
+        description: 'Enable security scanning'
+        required: false
+        type: boolean
+        default: true
+      enable-container-push:
+        description: 'Enable container push to registry'
+        required: false
+        type: boolean
+        default: true
+      enable-multi-arch:
+        description: 'Enable multi-architecture builds'
+        required: false
+        type: boolean
+        default: false
+      test-timeout:
+        description: 'Test timeout in minutes'
+        required: false
+        type: number
+        default: 10
+      coverage-threshold:
+        description: 'Minimum code coverage percentage (0 to skip)'
+        required: false
+        type: number
+        default: 0
+      install-cmd:
+        description: 'Install command'
+        required: false
+        type: string
+        default: 'pip install -r requirements.txt -r requirements-dev.txt'
+      lint-cmd:
+        description: 'Lint command'
+        required: false
+        type: string
+        default: 'ruff check src/ tests/ && ruff format --check src/ tests/'
+      type-check-cmd:
+        description: 'Type checking command'
+        required: false
+        type: string
+        default: 'mypy src/ --ignore-missing-imports'
+      test-cmd:
+        description: 'Test command'
+        required: false
+        type: string
+        default: 'pytest tests/ -v --tb=short'
+      pre-install-cmd:
+        description: 'Command to run before install (e.g., buf generate). Empty to skip.'
+        required: false
+        type: string
+        default: ''
+      app-repositories:
+        description: 'Additional repositories for GitHub App access (newline separated)'
+        required: false
+        type: string
+        default: ''
+      trivy-severity:
+        description: 'Trivy severity levels to check'
+        required: false
+        type: string
+        default: 'CRITICAL,HIGH'
+      trivy-timeout:
+        description: 'Trivy scan timeout (e.g. 10m0s)'
+        required: false
+        type: string
+        default: '10m0s'
+    secrets:
+      GH_APP_CICD_CID:
+        description: 'GitHub App client ID'
+        required: false
+      GH_APP_CICD_PK:
+        description: 'GitHub App private key'
+        required: false
+      CODECOV_TOKEN:
+        description: 'Codecov token (optional)'
+        required: false
+      SONAR_TOKEN:
+        description: 'SonarCloud token (optional)'
+        required: false
+    outputs:
+      image-tag:
+        description: 'Container image tag'
+        value: ${{ jobs.container.outputs.image-tag }}
+      coverage-percentage:
+        description: 'Code coverage percentage'
+        value: ${{ jobs.test.outputs.coverage }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ inputs.image-name || github.repository }}
+
+jobs:
+  # ─── Job 1: Test & Quality ──────────────────────────────────────────────────
+  test:
+    name: Test & Quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.test-timeout }}
+    outputs:
+      coverage: ${{ steps.coverage.outputs.percentage }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            ${{ inputs.working-directory }}/requirements*.txt
+            ${{ inputs.working-directory }}/pyproject.toml
+
+      - name: Pre-install
+        if: inputs.pre-install-cmd != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.pre-install-cmd }}
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          python -m pip install --upgrade pip
+          ${{ inputs.install-cmd }}
+
+      - name: Lint
+        if: inputs.lint-cmd != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.lint-cmd }}
+
+      - name: Type check
+        if: inputs.type-check-cmd != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.type-check-cmd }}
+
+      - name: Test
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.test-cmd }}
+
+      - name: Check coverage threshold
+        id: coverage
+        if: inputs.coverage-threshold > 0
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if [ -f coverage.xml ]; then
+            COVERAGE=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('coverage.xml')
+          rate = float(tree.getroot().attrib.get('line-rate', 0))
+          print(f'{rate * 100:.1f}')
+          ")
+            echo "percentage=${COVERAGE}" >> $GITHUB_OUTPUT
+            echo "Coverage: ${COVERAGE}% (threshold: ${{ inputs.coverage-threshold }}%)"
+            if (( $(echo "$COVERAGE < ${{ inputs.coverage-threshold }}" | bc -l) )); then
+              echo "::error::Coverage ${COVERAGE}% is below threshold ${{ inputs.coverage-threshold }}%"
+              exit 1
+            fi
+          else
+            echo "percentage=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload coverage to Codecov
+        if: hashFiles(format('{0}/coverage.xml', inputs.working-directory)) != ''
+        uses: codecov/codecov-action@v6
+        continue-on-error: true
+        with:
+          files: ${{ inputs.working-directory }}/coverage.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  # ─── Job 2: Security Scan ──────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-24.04
+    if: ${{ inputs.enable-security-scan }}
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+
+      - name: Pre-install
+        if: inputs.pre-install-cmd != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.pre-install-cmd }}
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          ${{ inputs.install-cmd }}
+
+      - name: pip-audit
+        working-directory: ${{ inputs.working-directory }}
+        run: pip-audit --strict --desc on || true
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.working-directory }}
+          format: table
+          severity: ${{ inputs.trivy-severity }}
+          exit-code: '0'
+          timeout: ${{ inputs.trivy-timeout }}
+
+  # ─── Job 3: Detect Container Variants ──────────────────────────────────────
+  detect-variants:
+    name: Detect Container Variants
+    runs-on: ubuntu-24.04
+    needs: [test]
+    if: ${{ inputs.enable-container-push }}
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      has-variants: ${{ steps.detect.outputs.has-variants }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect container build matrix
+        id: detect
+        run: |
+          MATRIX_FILE=""
+          for f in container-matrix.yml .container-matrix.yml .github/container-matrix.yml; do
+            if [ -f "$f" ]; then MATRIX_FILE="$f"; break; fi
+          done
+
+          if [ -n "$MATRIX_FILE" ]; then
+            echo "Found: $MATRIX_FILE"
+            MATRIX_JSON=$(python3 -c "
+          import yaml, json
+          with open('$MATRIX_FILE') as f:
+              config = yaml.safe_load(f)
+          matrix = {'include': []}
+          for v in config.get('variants', []):
+              platforms = v.get('platforms', ['linux/amd64'])
+              if isinstance(platforms, list): platforms = ','.join(platforms)
+              matrix['include'].append({
+                  'name': v.get('name', 'default'),
+                  'dockerfile': v.get('dockerfile', 'Dockerfile'),
+                  'platforms': platforms,
+                  'tag_patterns': v.get('tags', [])
+              })
+          print(json.dumps(matrix))
+          ")
+            echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+            echo "has-variants=true" >> $GITHUB_OUTPUT
+          else
+            echo "No container matrix found, using default"
+            echo 'matrix={"include":[{"name":"default","dockerfile":"Dockerfile","platforms":"linux/amd64","tag_patterns":[]}]}' >> $GITHUB_OUTPUT
+            echo "has-variants=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ─── Job 4: Container Build (Parallelized via matrix) ─────────────────────
+  container:
+    name: Build - ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    needs: [test, detect-variants]
+    if: ${{ inputs.enable-container-push }}
+    strategy:
+      matrix: ${{ fromJson(needs.detect-variants.outputs.matrix) }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.calver.outputs.version }}
+    steps:
+      - name: Generate CalVer
+        id: calver
+        run: |
+          echo "version=$(date -u '+%Y.%m.%d')-${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate tags
+        id: custom-tags
+        run: |
+          BRANCH=$(echo "${{ github.ref_name }}" | tr '/' '-')
+          CALVER="$(date -u '+%Y.%m.%d')-${{ github.run_number }}"
+          NAME="${{ matrix.name }}"
+
+          # Parse tag patterns from matrix
+          echo '${{ toJson(matrix.tag_patterns) }}' > /tmp/patterns.json
+          TAGS=$(python3 -c "
+          import json
+          with open('/tmp/patterns.json') as f:
+              patterns = json.load(f)
+          branch = '$BRANCH'
+          calver = '$CALVER'
+          name = '$NAME'
+          tags = []
+          for p in patterns:
+              resolved = p.replace('{branch}', branch).replace('{calver}', calver).replace('{name}', name)
+              tags.append(f'type=raw,value={resolved}')
+          if not patterns:
+              tags.append(f'type=raw,value={name}-{branch}-{calver}')
+              tags.append(f'type=raw,value={name}-{branch}-latest')
+          # Always add a sha tag
+          tags.append(f'type=sha,prefix={name}-{branch}-')
+          print('\n'.join(tags))
+          ")
+          {
+            echo 'tags<<EOF'
+            echo "$TAGS"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: ${{ steps.custom-tags.outputs.tags }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.working-directory }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ matrix.platforms }}
+
+  # ─── Job 5: Container Security Scan ────────────────────────────────────────
+  container-security:
+    name: Scan - ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    needs: [container, detect-variants]
+    if: ${{ inputs.enable-security-scan && inputs.enable-container-push }}
+    strategy:
+      matrix: ${{ fromJson(needs.detect-variants.outputs.matrix) }}
+    permissions:
+      security-events: write
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image reference
+        id: ref
+        run: |
+          BRANCH=$(echo "${{ github.ref_name }}" | tr '/' '-')
+          CALVER="$(date -u '+%Y.%m.%d')-${{ github.run_number }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          echo "image=${IMAGE}:${{ matrix.name }}-${BRANCH}-${CALVER}" >> $GITHUB_OUTPUT
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: ${{ steps.ref.outputs.image }}
+          format: table
+          severity: ${{ inputs.trivy-severity }}
+          ignore-unfixed: true
+          exit-code: '1'
+          timeout: ${{ inputs.trivy-timeout }}
