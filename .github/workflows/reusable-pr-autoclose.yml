@@ -1,0 +1,274 @@
+name: Reusable PR Auto-Close
+
+on:
+  workflow_call:
+    inputs:
+      days-before-stale:
+        description: 'Days of inactivity before marking PR as stale'
+        required: false
+        type: number
+        default: 30
+      days-before-close:
+        description: 'Days of inactivity before closing stale PR'
+        required: false
+        type: number
+        default: 7
+      exempt-pr-labels:
+        description: 'Comma-separated list of labels that exempt a PR from being closed'
+        required: false
+        type: string
+        default: 'keep-open,do-not-close,blocked,on-hold'
+      only-labels:
+        description: 'Only process PRs with these labels (comma-separated). Empty = process all PRs'
+        required: false
+        type: string
+        default: ''
+      exempt-milestones:
+        description: 'Whether to exempt PRs with milestones'
+        required: false
+        type: boolean
+        default: true
+      stale-pr-label:
+        description: 'Label to apply to stale PRs'
+        required: false
+        type: string
+        default: 'stale'
+      close-pr-label:
+        description: 'Label to apply when closing PRs'
+        required: false
+        type: string
+        default: 'auto-closed'
+      stale-pr-message:
+        description: 'Message to post when marking PR as stale'
+        required: false
+        type: string
+        default: |
+          This pull request has been automatically marked as stale because it has not had recent activity. 
+          It will be closed if no further activity occurs.
+
+          If you believe this PR should remain open, please:
+          - Add the `keep-open` label
+          - Leave a comment with updates
+          - Push new commits
+
+          Thank you for your contributions! 🙏
+      close-pr-message:
+        description: 'Message to post when closing stale PR'
+        required: false
+        type: string
+        default: |
+          This pull request has been automatically closed due to inactivity.
+
+          If you would like to continue working on this PR:
+          1. Reopen it
+          2. Add the `keep-open` label to prevent future auto-closure
+          3. Push updates or leave a comment
+
+          Thank you for your contribution! We appreciate your work. 🚀
+      operations-per-run:
+        description: 'Maximum number of operations per run (to avoid rate limiting)'
+        required: false
+        type: number
+        default: 30
+      ascending-order:
+        description: 'Whether to process PRs in ascending order by update time'
+        required: false
+        type: boolean
+        default: false
+      remove-stale-when-updated:
+        description: 'Whether to remove stale label when PR is updated'
+        required: false
+        type: boolean
+        default: true
+      enable-statistics:
+        description: 'Whether to generate statistics in workflow summary'
+        required: false
+        type: boolean
+        default: true
+      dry-run:
+        description: 'Enable dry-run mode (no actual changes, only logging)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      GH_APP_CICD_CID:
+        description: 'GitHub App ID for CI/CD authentication'
+        required: true
+      GH_APP_CICD_PK:
+        description: 'GitHub App private key for CI/CD authentication'
+        required: true
+    outputs:
+      stale-prs-count:
+        description: 'Number of stale PRs found'
+        value: ${{ jobs.stale.outputs.stale-count }}
+      closed-prs-count:
+        description: 'Number of PRs closed in this run'
+        value: ${{ jobs.stale.outputs.closed-count }}
+
+jobs:
+  stale:
+    name: Auto-Close Stale PRs
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    outputs:
+      stale-count: ${{ steps.stats.outputs.stale-count }}
+      closed-count: ${{ steps.stats.outputs.closed-count }}
+    
+    steps:
+    - name: Generate GitHub App token
+      id: app-token
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ secrets.GH_APP_CICD_CID }}
+        private-key: ${{ secrets.GH_APP_CICD_PK }}
+        owner: ${{ github.repository_owner }}
+
+    - name: Set auth token
+      id: auth
+      run: |
+        echo "Using generated GitHub App token"
+        echo "token=${{ steps.app-token.outputs.token }}" >> $GITHUB_OUTPUT
+
+    - name: Validate inputs
+      run: |
+        echo "🔍 Configuration:"
+        echo "  Days before stale: ${{ inputs.days-before-stale }}"
+        echo "  Days before close: ${{ inputs.days-before-close }}"
+        echo "  Exempt labels: ${{ inputs.exempt-pr-labels }}"
+        echo "  Only labels: ${{ inputs.only-labels }}"
+        echo "  Exempt milestones: ${{ inputs.exempt-milestones }}"
+        echo "  Stale label: ${{ inputs.stale-pr-label }}"
+        echo "  Close label: ${{ inputs.close-pr-label }}"
+        echo "  Operations per run: ${{ inputs.operations-per-run }}"
+        echo "  Dry run: ${{ inputs.dry-run }}"
+        
+        if [ ${{ inputs.days-before-stale }} -lt 1 ]; then
+          echo "❌ Error: days-before-stale must be at least 1"
+          exit 1
+        fi
+        
+        if [ ${{ inputs.days-before-close }} -lt 1 ]; then
+          echo "❌ Error: days-before-close must be at least 1"
+          exit 1
+        fi
+
+    - name: Close stale pull requests
+      uses: actions/stale@v10
+      id: stale
+      with:
+        repo-token: ${{ steps.auth.outputs.token }}
+        # PR-specific configuration
+        days-before-pr-stale: ${{ inputs.days-before-stale }}
+        days-before-pr-close: ${{ inputs.days-before-close }}
+        stale-pr-message: ${{ inputs.stale-pr-message }}
+        close-pr-message: ${{ inputs.close-pr-message }}
+        stale-pr-label: ${{ inputs.stale-pr-label }}
+        close-pr-label: ${{ inputs.close-pr-label }}
+        
+        # Exemptions
+        exempt-pr-labels: ${{ inputs.exempt-pr-labels }}
+        only-labels: ${{ inputs.only-labels }}
+        exempt-milestones: ${{ inputs.exempt-milestones }}
+        
+        # Issue configuration (disabled - only handle PRs)
+        days-before-issue-stale: -1
+        days-before-issue-close: -1
+        
+        # General settings
+        operations-per-run: ${{ inputs.operations-per-run }}
+        ascending: ${{ inputs.ascending-order }}
+        remove-stale-when-updated: ${{ inputs.remove-stale-when-updated }}
+        
+        # Enable debugging for dry-run
+        debug-only: ${{ inputs.dry-run }}
+
+    - name: Generate statistics
+      if: always() && fromJSON(inputs.enable-statistics)
+      id: stats
+      uses: actions/github-script@v8
+      with:
+        github-token: ${{ steps.auth.outputs.token }}
+        script: |
+          const staleLabelName = '${{ inputs.stale-pr-label }}';
+          const closeLabelName = '${{ inputs.close-pr-label }}';
+          
+          // Get all PRs (open and closed recently)
+          const { data: openPRs } = await github.rest.pulls.list({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'open',
+            per_page: 100
+          });
+          
+          const { data: closedPRs } = await github.rest.pulls.list({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'closed',
+            per_page: 100,
+            sort: 'updated',
+            direction: 'desc'
+          });
+          
+          // Filter PRs with labels
+          const stalePRs = openPRs.filter(pr => 
+            pr.labels.some(label => label.name === staleLabelName)
+          );
+          
+          const autoClosedPRs = closedPRs.filter(pr => 
+            pr.labels.some(label => label.name === closeLabelName) &&
+            new Date(pr.closed_at) > new Date(Date.now() - 24*60*60*1000) // Last 24h
+          );
+          
+          // Generate summary
+          const summary = `# 🤖 PR Auto-Close Statistics
+          
+          ## 📊 Current Status
+          
+          | Metric | Count |
+          |--------|-------|
+          | Open PRs | ${openPRs.length} |
+          | Stale PRs | ${stalePRs.length} |
+          | Auto-closed (last 24h) | ${autoClosedPRs.length} |
+          
+          ## ⚙️ Configuration
+          
+          | Setting | Value |
+          |---------|-------|
+          | Days before stale | ${{ inputs.days-before-stale }} |
+          | Days before close | ${{ inputs.days-before-close }} |
+          | Stale label | \`${{ inputs.stale-pr-label }}\` |
+          | Close label | \`${{ inputs.close-pr-label }}\` |
+          | Exempt milestones | ${{ inputs.exempt-milestones }} |
+          | Dry run | ${{ inputs.dry-run }} |
+          
+          ## 📋 Stale PRs List
+          
+          ${stalePRs.length > 0 ? stalePRs.map(pr => {
+            const daysSinceUpdate = Math.floor((Date.now() - new Date(pr.updated_at)) / (1000 * 60 * 60 * 24));
+            const totalDaysBeforeClose = ${{ inputs.days-before-stale }} + ${{ inputs.days-before-close }};
+            const daysUntilClose = Math.max(0, totalDaysBeforeClose - daysSinceUpdate);
+            return `- #${pr.number}: [${pr.title}](${pr.html_url}) - ${daysSinceUpdate} days inactive, closes in ~${daysUntilClose} days`;
+          }).join('\n') : '_No stale PRs currently_'}
+          
+          ${autoClosedPRs.length > 0 ? `## 🔒 Recently Auto-Closed PRs
+          
+          ${autoClosedPRs.map(pr => `- #${pr.number}: [${pr.title}](${pr.html_url}) - closed ${new Date(pr.closed_at).toLocaleString()}`).join('\n')}` : ''}
+          
+          ---
+          _Updated: ${new Date().toUTCString()}_`;
+          
+          await core.summary.addRaw(summary).write();
+          
+          // Set outputs
+          core.setOutput('stale-count', stalePRs.length);
+          core.setOutput('closed-count', autoClosedPRs.length);
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "✅ PR auto-close workflow completed"
+        if [ "${{ inputs.dry-run }}" = "true" ]; then
+          echo "ℹ️ Dry-run mode was enabled - no actual changes were made"
+        fi

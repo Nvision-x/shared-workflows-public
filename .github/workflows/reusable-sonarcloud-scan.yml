@@ -1,0 +1,108 @@
+name: Reusable SonarCloud Scan
+
+on:
+  workflow_call:
+    inputs:
+      project-key:
+        description: 'SonarCloud project key. Defaults to the repository name.'
+        required: false
+        type: string
+        default: ''
+      organization:
+        description: 'SonarCloud organization slug'
+        required: false
+        type: string
+        default: 'nvision-x'
+      working-directory:
+        description: 'Repo subdirectory to scan (projectBaseDir for sonar-scanner)'
+        required: false
+        type: string
+        default: '.'
+      fail-on-quality-gate:
+        description: 'If true, fail the job when the quality gate fails. If false, warn only.'
+        required: false
+        type: boolean
+        default: true
+      coverage-artifact-name:
+        description: 'Name of a coverage artifact uploaded by the caller (leave empty to skip coverage import)'
+        required: false
+        type: string
+        default: ''
+      coverage-artifact-path:
+        description: 'Where to extract the coverage artifact, relative to working-directory'
+        required: false
+        type: string
+        default: '.'
+      extra-args:
+        description: 'Additional -D flags passed to sonar-scanner (space-separated)'
+        required: false
+        type: string
+        default: ''
+      runner:
+        description: 'GitHub Actions runner label'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+    secrets:
+      SONAR_TOKEN:
+        description: 'SonarCloud authentication token'
+        required: true
+    outputs:
+      quality-gate-status:
+        description: 'Quality gate result: PASSED, FAILED, or WARN'
+        value: ${{ jobs.scan.outputs.quality-gate-status }}
+
+jobs:
+  scan:
+    name: SonarCloud Scan
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      quality-gate-status: ${{ steps.gate.outputs.quality-gate-status }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download coverage artifact
+        if: inputs.coverage-artifact-name != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.coverage-artifact-name }}
+          path: ${{ inputs.working-directory }}/${{ inputs.coverage-artifact-path }}
+
+      - name: Resolve project key
+        id: project_key
+        env:
+          INPUT_KEY: ${{ inputs.project-key }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: echo "key=${INPUT_KEY:-$REPO_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v7
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          projectBaseDir: ${{ inputs.working-directory }}
+          args: >
+            -Dsonar.projectKey=${{ steps.project_key.outputs.key }}
+            -Dsonar.organization=${{ inputs.organization }}
+            ${{ inputs.extra-args }}
+
+      - name: Quality gate
+        id: gate
+        continue-on-error: ${{ !inputs.fail-on-quality-gate }}
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          scanMetadataReportFile: ${{ inputs.working-directory }}/.scannerwork/report-task.txt
+
+      - name: Warn on quality gate failure
+        if: ${{ !inputs.fail-on-quality-gate && steps.gate.outcome != 'success' }}
+        env:
+          GATE_STATUS: ${{ steps.gate.outputs.quality-gate-status }}
+        run: |
+          echo "::warning title=SonarCloud Quality Gate::Quality gate status: ${GATE_STATUS:-FAILED}. Running in warn-only mode (fail-on-quality-gate=false). Review results in SonarCloud."
