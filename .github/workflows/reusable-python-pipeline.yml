@@ -178,7 +178,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: hashFiles(format('{0}/coverage.xml', inputs.working-directory)) != ''
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         continue-on-error: true
         with:
           files: ${{ inputs.working-directory }}/coverage.xml
