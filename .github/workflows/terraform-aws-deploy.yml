@@ -23,6 +23,14 @@ on:
         description: IAM role name for OIDC authentication
         type: string
         default: "NxGitHubActionsRole"
+      apply_environment:
+        description: >
+          GitHub Environment to attach to the apply job. Set this to an
+          environment with required reviewers to gate applies behind a manual
+          approval. Empty (the default) applies with no approval step, which is
+          the existing behaviour for callers that do not set it.
+        type: string
+        default: ""
     secrets:
       tf_var_docker_hub_token:
         description: Docker Hub read-only token
@@ -102,6 +110,7 @@ jobs:
     name: Terraform Apply
     needs: terraform-plan
     runs-on: codebuild-github-actions-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    environment: ${{ inputs.apply_environment }}
     permissions:
       id-token: write
       contents: read
