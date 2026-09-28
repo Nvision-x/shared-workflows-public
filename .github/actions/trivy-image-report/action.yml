@@ -88,7 +88,8 @@ runs:
         IGNORE_UNFIXED: ${{ inputs.ignore-unfixed }}
         EXIT_CODE: ${{ steps.policy.outputs.exit-code }}
       run: |
-        trivy convert --scanners vuln --format table --output "$TRIVY_TABLE" "$TRIVY_JSON" \
+        # detailed mode skips the per-target summary, which lists every clean package METADATA as a 0 row
+        trivy convert --scanners vuln --format table --table-mode detailed --output "$TRIVY_TABLE" "$TRIVY_JSON" \
           || echo "(table render failed; see $TRIVY_JSON artifact)" > "$TRIVY_TABLE"
 
         TOTAL=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$TRIVY_JSON")
