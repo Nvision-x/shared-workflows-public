@@ -1,0 +1,152 @@
+name: Trivy image report
+description: Scan a container image with Trivy, write a findings summary to the run page, upload the report, and optionally fail on findings.
+
+inputs:
+  image-ref:
+    description: Image reference to scan (local tag or registry ref)
+    required: true
+  label:
+    description: Short name used in the summary heading and artifact name (must be unique per run)
+    required: true
+  severity:
+    description: Comma-separated severities that count as findings
+    default: CRITICAL,HIGH
+  ignore-unfixed:
+    description: Ignore vulnerabilities with no fixed version available
+    default: 'true'
+  vuln-type:
+    description: Vulnerability types to scan (os, library)
+    default: os,library
+  exit-code:
+    description: "Exit code when findings are present. Empty = org policy default (see resolve step). 0 = report only, 1 = fail."
+    default: ''
+  timeout:
+    description: Trivy scan timeout
+    default: 10m0s
+  retention-days:
+    description: Days to keep the report artifact
+    default: '30'
+
+outputs:
+  total:
+    description: Number of findings at the configured severities
+    value: ${{ steps.findings.outputs.total }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve policy
+      id: policy
+      shell: bash
+      env:
+        EXIT_CODE: ${{ inputs.exit-code }}
+        REF: ${{ inputs.image-ref }}
+      run: |
+        # Org default lives here so every pipeline flips together. 0 = report only, 1 = fail.
+        echo "exit-code=${EXIT_CODE:-0}" >> "$GITHUB_OUTPUT"
+
+        # ghcr rejects uppercase repo paths (github.repository is mixed case); tags/digests keep their case
+        if [[ "$REF" == *@* ]]; then
+          REPO="${REF%%@*}"; REST="@${REF#*@}"
+        elif [[ "${REF##*/}" == *:* ]]; then
+          REPO="${REF%:*}"; REST=":${REF##*:}"
+        else
+          REPO="$REF"; REST=""
+        fi
+        echo "image-ref=${REPO,,}${REST}" >> "$GITHUB_OUTPUT"
+        echo "json=trivy-${{ inputs.label }}.json" >> "$GITHUB_OUTPUT"
+        echo "table=trivy-${{ inputs.label }}.txt" >> "$GITHUB_OUTPUT"
+
+    # exit-code stays 0 here so the summary/artifact steps always run; the gate step below decides
+    - name: Trivy image scan
+      uses: aquasecurity/trivy-action@v0.35.0
+      env:
+        TRIVY_DISABLE_VEX_NOTICE: "true"
+      with:
+        image-ref: ${{ steps.policy.outputs.image-ref }}
+        format: json
+        output: ${{ steps.policy.outputs.json }}
+        scanners: vuln
+        vuln-type: ${{ inputs.vuln-type }}
+        severity: ${{ inputs.severity }}
+        ignore-unfixed: ${{ inputs.ignore-unfixed }}
+        exit-code: '0'
+        timeout: ${{ inputs.timeout }}
+
+    - name: Summarize findings
+      id: findings
+      shell: bash
+      env:
+        TRIVY_JSON: ${{ steps.policy.outputs.json }}
+        TRIVY_TABLE: ${{ steps.policy.outputs.table }}
+        IMAGE_REF: ${{ steps.policy.outputs.image-ref }}
+        LABEL: ${{ inputs.label }}
+        SEVERITIES: ${{ inputs.severity }}
+        VULN_TYPE: ${{ inputs.vuln-type }}
+        IGNORE_UNFIXED: ${{ inputs.ignore-unfixed }}
+        EXIT_CODE: ${{ steps.policy.outputs.exit-code }}
+      run: |
+        trivy convert --scanners vuln --format table --output "$TRIVY_TABLE" "$TRIVY_JSON" \
+          || echo "(table render failed; see $TRIVY_JSON artifact)" > "$TRIVY_TABLE"
+
+        TOTAL=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$TRIVY_JSON")
+        echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+        MODE="report only"
+        [ "$EXIT_CODE" != "0" ] && MODE="fails the job"
+
+        {
+          echo "## 🛡️ Trivy image scan — \`$LABEL\`"
+          echo ""
+          echo "\`$IMAGE_REF\`"
+          echo ""
+          echo "Policy: severities \`$SEVERITIES\`, types \`$VULN_TYPE\`, ignore-unfixed=$IGNORE_UNFIXED, findings $MODE."
+          echo ""
+          echo "| Severity | Count |"
+          echo "|----------|-------|"
+          for SEV in ${SEVERITIES//,/ }; do
+            N=$(jq --arg s "$SEV" '[.Results[]?.Vulnerabilities[]? | select(.Severity == $s)] | length' "$TRIVY_JSON")
+            echo "| $SEV | $N |"
+          done
+          echo "| **Total** | **$TOTAL** |"
+          echo ""
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "<details><summary>Full report</summary>"
+            echo ""
+            echo '```'
+            cat "$TRIVY_TABLE"
+            echo '```'
+            echo "</details>"
+          else
+            echo "✅ No findings at the configured severities."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        echo "Trivy findings for $LABEL: $TOTAL"
+        cat "$TRIVY_TABLE"
+
+    - name: Upload scan results
+      uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: trivy-${{ inputs.label }}-${{ github.run_number }}
+        path: |
+          ${{ steps.policy.outputs.json }}
+          ${{ steps.policy.outputs.table }}
+        retention-days: ${{ inputs.retention-days }}
+
+    - name: Gate on findings
+      shell: bash
+      env:
+        TOTAL: ${{ steps.findings.outputs.total }}
+        EXIT_CODE: ${{ steps.policy.outputs.exit-code }}
+        LABEL: ${{ inputs.label }}
+        SEVERITIES: ${{ inputs.severity }}
+      run: |
+        if [ "$TOTAL" -gt 0 ] && [ "$EXIT_CODE" != "0" ]; then
+          echo "::error title=Trivy::$TOTAL $SEVERITIES vulnerabilities in $LABEL image"
+          exit "$EXIT_CODE"
+        fi
+        if [ "$TOTAL" -gt 0 ]; then
+          echo "::warning title=Trivy::$TOTAL $SEVERITIES vulnerabilities in $LABEL image (report-only mode)"
+        fi
