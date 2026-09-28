@@ -83,6 +83,11 @@ on:
         required: false
         type: string
         default: '10m0s'
+      trivy-exit-code:
+        description: 'Exit code when image findings are present: 0 = report only, 1 = fail the job. Empty = org policy default from the trivy-image-report action.'
+        required: false
+        type: string
+        default: ''
     secrets:
       GH_APP_CICD_CID:
         description: 'GitHub App client ID'
@@ -359,9 +364,9 @@ jobs:
     needs: [container, detect-variants]
     if: ${{ inputs.enable-security-scan && inputs.enable-container-push }}
     strategy:
+      fail-fast: false
       matrix: ${{ fromJson(needs.detect-variants.outputs.matrix) }}
     permissions:
-      security-events: write
       packages: read
     steps:
       - name: Log in to GHCR
@@ -381,11 +386,10 @@ jobs:
           echo "image=${IMAGE}:${{ matrix.name }}-${BRANCH}-${CALVER}" >> $GITHUB_OUTPUT
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@v0.35.0
+        uses: Nvision-x/shared-workflows-public/.github/actions/trivy-image-report@main
         with:
           image-ref: ${{ steps.ref.outputs.image }}
-          format: table
+          label: ${{ matrix.name }}
           severity: ${{ inputs.trivy-severity }}
-          ignore-unfixed: true
-          exit-code: '1'
+          exit-code: ${{ inputs.trivy-exit-code }}
           timeout: ${{ inputs.trivy-timeout }}
