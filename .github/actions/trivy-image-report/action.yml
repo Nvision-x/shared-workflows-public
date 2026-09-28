@@ -64,6 +64,8 @@ runs:
         TRIVY_DISABLE_VEX_NOTICE: "true"
       with:
         image-ref: ${{ steps.policy.outputs.image-ref }}
+        # default cache-dir is inside the checkout, so a later `COPY .` drags the vuln DB into the image
+        cache-dir: ${{ runner.temp }}/trivy-cache
         format: json
         output: ${{ steps.policy.outputs.json }}
         scanners: vuln
